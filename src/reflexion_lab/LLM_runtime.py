@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import OpenAI
 
 from .prompts import ACTOR_SYSTEM, EVALUATOR_SYSTEM, REFLECTOR_SYSTEM
 from .schemas import JudgeResult, QAExample, ReflectionEntry
@@ -16,11 +16,11 @@ from .utils import normalize_answer
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 
 FAILURE_MODE_BY_QID = {
     "hp2": "incomplete_multi_hop",
@@ -51,32 +51,41 @@ def _context_text(example: QAExample) -> str:
     return _normalize_lines(lines)
 
 
-def _call_gemini(system_instruction: str, user_prompt: str, *, response_mime_type: str | None = None, max_output_tokens: int = 512) -> RuntimeCall:
-    if not GEMINI_API_KEY:
+def _call_openai(system_instruction: str, user_prompt: str, *, response_mime_type: str | None = None, max_output_tokens: int = 512) -> RuntimeCall:
+    if not OPENAI_API_KEY:
         raise RuntimeError(
-            "GEMINI_API_KEY is missing. Set it in your environment or .env before running benchmark.")
+            "OPENAI_API_KEY is missing. Set it in your environment or .env before running benchmark.")
 
-    generation_config: dict[str, Any] = {
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+    request_kwargs: dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_prompt},
+        ],
         "temperature": 0.0,
-        "max_output_tokens": max_output_tokens,
+        "max_tokens": max_output_tokens,
     }
-    if response_mime_type:
-        generation_config["response_mime_type"] = response_mime_type
+    if response_mime_type == "application/json":
+        request_kwargs["response_format"] = {"type": "json_object"}
 
     start = time.perf_counter()
     try:
-        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=system_instruction)
-        response = model.generate_content(user_prompt, generation_config=generation_config)
+        response = client.chat.completions.create(**request_kwargs)
     except Exception as exc:  # pragma: no cover - SDK raises multiple exception types
-        raise RuntimeError(f"Gemini SDK request failed: {exc}") from exc
+        raise RuntimeError(f"OpenAI SDK request failed: {exc}") from exc
 
     latency_ms = int((time.perf_counter() - start) * 1000)
-    text = (response.text or "").strip()
+    text = (response.choices[0].message.content or "").strip()
 
-    usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
-    completion_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
-    total_tokens = int(getattr(usage, "total_token_count", 0) or 0)
+    usage = getattr(response, "usage", None)
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
     if total_tokens == 0:
         total_tokens = prompt_tokens + completion_tokens
     if total_tokens == 0:
@@ -86,6 +95,10 @@ def _call_gemini(system_instruction: str, user_prompt: str, *, response_mime_typ
     raw_payload: dict[str, Any] = {}
     if hasattr(response, "to_dict"):
         converted = response.to_dict()
+        if isinstance(converted, dict):
+            raw_payload = converted
+    elif hasattr(response, "model_dump"):
+        converted = response.model_dump()
         if isinstance(converted, dict):
             raw_payload = converted
 
@@ -110,10 +123,10 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
     match = re.search(r"\{.*\}", stripped, flags=re.S)
     if not match:
-        raise ValueError(f"Gemini did not return a JSON object: {text}")
+        raise ValueError(f"OpenAI did not return a JSON object: {text}")
     parsed = json.loads(match.group(0))
     if not isinstance(parsed, dict):
-        raise ValueError("Gemini JSON response must be an object.")
+        raise ValueError("OpenAI JSON response must be an object.")
     return parsed
 
 
@@ -159,12 +172,12 @@ def _build_reflector_prompt(example: QAExample, attempt_id: int, answer: str, ju
 def actor_answer(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> RuntimeCall:
     user_prompt = _build_actor_prompt(
         example, attempt_id, agent_type, reflection_memory)
-    return _call_gemini(ACTOR_SYSTEM, user_prompt, max_output_tokens=256)
+    return _call_openai(ACTOR_SYSTEM, user_prompt, max_output_tokens=256)
 
 
 def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, RuntimeCall]:
     user_prompt = _build_evaluator_prompt(example, answer)
-    call = _call_gemini(EVALUATOR_SYSTEM, user_prompt,
+    call = _call_openai(EVALUATOR_SYSTEM, user_prompt,
                         response_mime_type="application/json", max_output_tokens=256)
     payload = _extract_json_object(call.text)
     judge = JudgeResult.model_validate(payload)
@@ -182,7 +195,7 @@ def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, RuntimeCall
 
 def reflector(example: QAExample, attempt_id: int, answer: str, judge: JudgeResult) -> tuple[ReflectionEntry, RuntimeCall]:
     user_prompt = _build_reflector_prompt(example, attempt_id, answer, judge)
-    call = _call_gemini(REFLECTOR_SYSTEM, user_prompt,
+    call = _call_openai(REFLECTOR_SYSTEM, user_prompt,
                         response_mime_type="application/json", max_output_tokens=256)
     payload = _extract_json_object(call.text)
     reflection = ReflectionEntry.model_validate(payload)
