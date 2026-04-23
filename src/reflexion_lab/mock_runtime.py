@@ -1,26 +1,189 @@
 from __future__ import annotations
-from .schemas import QAExample, JudgeResult, ReflectionEntry
+import json
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+from .prompts import ACTOR_SYSTEM, EVALUATOR_SYSTEM, REFLECTOR_SYSTEM
+from .schemas import JudgeResult, QAExample, ReflectionEntry
 from .utils import normalize_answer
 
-FIRST_ATTEMPT_WRONG = {"hp2": "London", "hp4": "Atlantic Ocean", "hp6": "Red Sea", "hp8": "Andes"}
-FAILURE_MODE_BY_QID = {"hp2": "incomplete_multi_hop", "hp4": "wrong_final_answer", "hp6": "entity_drift", "hp8": "entity_drift"}
 
-def actor_answer(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> str:
-    if example.qid not in FIRST_ATTEMPT_WRONG:
-        return example.gold_answer
-    if agent_type == "react":
-        return FIRST_ATTEMPT_WRONG[example.qid]
-    if attempt_id == 1 and not reflection_memory:
-        return FIRST_ATTEMPT_WRONG[example.qid]
-    return example.gold_answer
+load_dotenv()
 
-def evaluator(example: QAExample, answer: str) -> JudgeResult:
-    if normalize_answer(example.gold_answer) == normalize_answer(answer):
-        return JudgeResult(score=1, reason="Final answer matches the gold answer after normalization.")
-    if normalize_answer(answer) == "london":
-        return JudgeResult(score=0, reason="The answer stopped at the birthplace city and never completed the second hop to the river.", missing_evidence=["Need to identify the river that flows through London."], spurious_claims=[])
-    return JudgeResult(score=0, reason="The final answer selected the wrong second-hop entity.", missing_evidence=["Need to ground the answer in the second paragraph."], spurious_claims=[answer])
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
 
-def reflector(example: QAExample, attempt_id: int, judge: JudgeResult) -> ReflectionEntry:
-    strategy = "Do the second hop explicitly: birthplace city -> river through that city." if example.qid == "hp2" else "Verify the final entity against the second paragraph before answering."
-    return ReflectionEntry(attempt_id=attempt_id, failure_reason=judge.reason, lesson="A partial first-hop answer is not enough; the final answer must complete all hops.", next_strategy=strategy)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+FAILURE_MODE_BY_QID = {
+    "hp2": "incomplete_multi_hop",
+    "hp4": "wrong_final_answer",
+    "hp6": "entity_drift",
+    "hp8": "entity_drift",
+}
+
+
+@dataclass
+class RuntimeCall:
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def _normalize_lines(lines: list[str]) -> str:
+    return "\n".join(line for line in lines if line)
+
+
+def _context_text(example: QAExample) -> str:
+    lines = []
+    for index, chunk in enumerate(example.context_chunks, start=1):
+        lines.append(f"[{index}] {chunk.title}: {chunk.text}")
+    return _normalize_lines(lines)
+
+
+def _call_gemini(system_instruction: str, user_prompt: str, *, response_mime_type: str | None = None, max_output_tokens: int = 512) -> RuntimeCall:
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Set it in your environment or .env before running benchmark.")
+
+    generation_config: dict[str, Any] = {
+        "temperature": 0.0,
+        "max_output_tokens": max_output_tokens,
+    }
+    if response_mime_type:
+        generation_config["response_mime_type"] = response_mime_type
+
+    start = time.perf_counter()
+    try:
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=system_instruction)
+        response = model.generate_content(user_prompt, generation_config=generation_config)
+    except Exception as exc:  # pragma: no cover - SDK raises multiple exception types
+        raise RuntimeError(f"Gemini SDK request failed: {exc}") from exc
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    text = (response.text or "").strip()
+
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+    completion_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+    total_tokens = int(getattr(usage, "total_token_count", 0) or 0)
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if total_tokens == 0:
+        total_tokens = len(re.findall(
+            r"\w+|[^\w\s]", f"{system_instruction}\n{user_prompt}\n{text}", flags=re.UNICODE))
+
+    raw_payload: dict[str, Any] = {}
+    if hasattr(response, "to_dict"):
+        converted = response.to_dict()
+        if isinstance(converted, dict):
+            raw_payload = converted
+
+    return RuntimeCall(
+        text=text,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        latency_ms=latency_ms,
+        raw=raw_payload,
+    )
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", stripped, flags=re.S)
+    if not match:
+        raise ValueError(f"Gemini did not return a JSON object: {text}")
+    parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("Gemini JSON response must be an object.")
+    return parsed
+
+
+def _build_actor_prompt(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> str:
+    reflection_block = "\n".join(
+        f"- {item}" for item in reflection_memory) or "- None"
+    return (
+        f"Question: {example.question}\n"
+        f"Dataset id: {example.id}\n"
+        f"Attempt: {attempt_id}\n"
+        f"Agent type: {agent_type}\n\n"
+        f"Context:\n{_context_text(example)}\n\n"
+        f"Reflection memory:\n{reflection_block}\n\n"
+        "Return only the final answer text."
+    )
+
+
+def _build_evaluator_prompt(example: QAExample, answer: str) -> str:
+    return (
+        f"Question: {example.question}\n"
+        f"Gold answer: {example.answer}\n"
+        f"Predicted answer: {answer}\n\n"
+        f"Context:\n{_context_text(example)}\n\n"
+        "Apply strict normalized exact match and return JSON only."
+    )
+
+
+def _build_reflector_prompt(example: QAExample, attempt_id: int, answer: str, judge: JudgeResult) -> str:
+    return (
+        f"Question: {example.question}\n"
+        f"Gold answer: {example.answer}\n"
+        f"Attempt id: {attempt_id}\n"
+        f"Previous answer: {answer}\n"
+        f"Judge score: {judge.score}\n"
+        f"Judge reason: {judge.reason}\n"
+        f"Missing evidence: {json.dumps(judge.missing_evidence, ensure_ascii=False)}\n"
+        f"Spurious claims: {json.dumps(judge.spurious_claims, ensure_ascii=False)}\n\n"
+        f"Context:\n{_context_text(example)}\n\n"
+        "Return JSON with attempt_id, failure_reason, lesson, next_strategy."
+    )
+
+
+def actor_answer(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> RuntimeCall:
+    user_prompt = _build_actor_prompt(
+        example, attempt_id, agent_type, reflection_memory)
+    return _call_gemini(ACTOR_SYSTEM, user_prompt, max_output_tokens=256)
+
+
+def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, RuntimeCall]:
+    user_prompt = _build_evaluator_prompt(example, answer)
+    call = _call_gemini(EVALUATOR_SYSTEM, user_prompt,
+                        response_mime_type="application/json", max_output_tokens=256)
+    payload = _extract_json_object(call.text)
+    judge = JudgeResult.model_validate(payload)
+
+    if not judge.score:
+        normalized_answer = normalize_answer(answer)
+        if normalized_answer == "london" and not judge.missing_evidence:
+            judge.missing_evidence.append(
+                "Need to identify the river that flows through London.")
+        if not judge.spurious_claims and answer:
+            judge.spurious_claims.append(answer)
+
+    return judge, call
+
+
+def reflector(example: QAExample, attempt_id: int, answer: str, judge: JudgeResult) -> tuple[ReflectionEntry, RuntimeCall]:
+    user_prompt = _build_reflector_prompt(example, attempt_id, answer, judge)
+    call = _call_gemini(REFLECTOR_SYSTEM, user_prompt,
+                        response_mime_type="application/json", max_output_tokens=256)
+    payload = _extract_json_object(call.text)
+    reflection = ReflectionEntry.model_validate(payload)
+    return reflection, call
